@@ -5,11 +5,13 @@ author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
 n8n_template: https://github.com/owndev/Open-WebUI-Functions/blob/main/pipelines/n8n/Open_WebUI_Test_Agent_Streaming.json
-version: 2.2.0
+version: 2.3.0
 license: Apache License 2.0
-description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats. Now includes configurable AI Agent tool usage display with three verbosity levels (minimal, compact, detailed) and customizable length limits for tool inputs/outputs (non-streaming mode only).
+description: An optimized streaming-enabled pipeline for interacting with N8N workflows, consistent response handling for both streaming and non-streaming modes, robust error handling, and simplified status management. Supports Server-Sent Events (SSE) streaming and various N8N workflow formats. Now includes configurable AI Agent tool usage display with three verbosity levels (minimal, compact, detailed) and customizable length limits for tool inputs/outputs (non-streaming mode only). v2.3.0 adds separate streaming and non-streaming endpoint configuration to prevent UI bugs with auto-summary, tags, and follow-up questions in streaming mode.
 features:
   - Integrates with N8N for seamless streaming communication.
+  - Separate streaming and non-streaming endpoint configuration (v2.3.0).
+  - Toggle to enable/disable streaming for chat responses (v2.3.0).
   - Uses FastAPI StreamingResponse for real-time streaming.
   - Enables real-time interaction with N8N workflows.
   - Provides configurable status emissions and chunk streaming.
@@ -36,7 +38,6 @@ from typing import (
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
-from starlette.background import BackgroundTask
 from cryptography.fernet import Fernet, InvalidToken
 import aiohttp
 import os
@@ -44,10 +45,8 @@ import base64
 import hashlib
 import logging
 import json
-import asyncio
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT, SRC_LOG_LEVELS
 from pydantic_core import core_schema
-import time
 import re
 
 
@@ -182,7 +181,6 @@ async def stream_processor(
             # Process complete lines (retain trailing newline info)
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
-                had_newline = True
                 original_line = line  # without \n
                 if line.endswith("\r"):
                     line = line[:-1]
@@ -276,7 +274,19 @@ class Pipe:
     class Valves(BaseModel):
         N8N_URL: str = Field(
             default="https://<your-endpoint>/webhook/<your-webhook>",
-            description="URL for the N8N webhook",
+            description="[DEPRECATED] URL for the N8N webhook. Use N8N_STREAMING_URL and N8N_NON_STREAMING_URL instead for better control. Falls back to this if new URLs are not set.",
+        )
+        N8N_STREAMING_URL: str = Field(
+            default="",
+            description="URL for the N8N webhook that supports streaming responses. Used when ENABLE_STREAMING is True. If empty, falls back to N8N_URL.",
+        )
+        N8N_NON_STREAMING_URL: str = Field(
+            default="",
+            description="URL for the N8N webhook that returns non-streaming responses. Used when ENABLE_STREAMING is False or for non-chat requests. If empty, falls back to N8N_URL.",
+        )
+        ENABLE_STREAMING: bool = Field(
+            default=True,
+            description="Enable streaming for chat responses. When True, uses N8N_STREAMING_URL; when False, uses N8N_NON_STREAMING_URL. Helps prevent UI bugs with auto-summary, tags, and follow-up questions.",
         )
         N8N_BEARER_TOKEN: EncryptedStr = Field(
             default="",
@@ -320,6 +330,24 @@ class Pipe:
         self.valves = self.Valves()
         self.log = logging.getLogger("n8n_streaming_pipeline")
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
+
+    def get_n8n_url(self) -> str:
+        """
+        Get the appropriate N8N URL based on streaming configuration.
+
+        Returns:
+            The N8N webhook URL to use for the request
+        """
+        # If streaming is enabled and streaming URL is set, use it
+        if self.valves.ENABLE_STREAMING and self.valves.N8N_STREAMING_URL:
+            return self.valves.N8N_STREAMING_URL
+
+        # If streaming is disabled and non-streaming URL is set, use it
+        if not self.valves.ENABLE_STREAMING and self.valves.N8N_NON_STREAMING_URL:
+            return self.valves.N8N_NON_STREAMING_URL
+
+        # Fallback to the original N8N_URL for backward compatibility
+        return self.valves.N8N_URL
 
     def _format_tool_calls_section(
         self, intermediate_steps: list, for_streaming: bool = False
@@ -821,13 +849,17 @@ class Pipe:
                 # Get headers for the request
                 headers = self.get_headers()
 
+                # Get the appropriate N8N URL based on configuration
+                n8n_url = self.get_n8n_url()
+
                 # Create session with no timeout like in stream-example.py
                 session = aiohttp.ClientSession(
                     trust_env=True,
                     timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
                 )
 
-                self.log.debug(f"Sending request to N8N: {self.valves.N8N_URL}")
+                self.log.debug(f"Sending request to N8N: {n8n_url}")
+                self.log.debug(f"Streaming enabled: {self.valves.ENABLE_STREAMING}")
 
                 # Send status update via event emitter if available
                 if __event_emitter__:
@@ -843,9 +875,7 @@ class Pipe:
                     )
 
                 # Make the request
-                request = session.post(
-                    self.valves.N8N_URL, json=payload, headers=headers
-                )
+                request = session.post(n8n_url, json=payload, headers=headers)
 
                 response = await request.__aenter__()
                 self.log.debug(f"Response status: {response.status}")
@@ -1164,7 +1194,6 @@ class Pipe:
                         async def read_body_safely():
                             text_body = None
                             json_body = None
-                            lowered = content_type.lower()
                             try:
                                 # Read as text first (works for all content types)
                                 text_body = await response.text()
@@ -1387,7 +1416,7 @@ class Pipe:
                             user_error_msg = f"N8N Error: {error_json['message']}"
                         if "hint" in error_json:
                             user_error_msg += f"\n\nHint: {error_json['hint']}"
-                    except:
+                    except (json.JSONDecodeError, Exception):
                         # If not JSON, use raw text but truncate if too long
                         if error_text:
                             truncated = (
